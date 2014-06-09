@@ -181,9 +181,9 @@ abstract class BasePlatformService extends Seed implements PlatformServiceLike, 
     /**
      * @param bool $wrapContent If true, inbound request data is wrapped in an array with static::RECORD_WRAPPER as key
      *
-     * @return array
+     * @return $this
      */
-    protected function _buildRequestData( $wrapContent = false )
+    protected function _detectResourceMembers( $wrapContent = false )
     {
         $_payload = RestData::getPostedData( true, true );
 
@@ -196,39 +196,9 @@ abstract class BasePlatformService extends Seed implements PlatformServiceLike, 
         // MERGE URL parameters with posted data, posted data takes precedence
         $_payload = array_merge( $_REQUEST, $_payload );
 
-        //  look for limit, accept top as well as limit
-        $this->_checkPayloadParameter( $_payload, 'limit', 'top' );
-        $this->_checkPayloadParameter( $_payload, 'offset', 'skip' );
-        $this->_checkPayloadParameter( $_payload, 'order', 'sort' );
+        $this->_requestData = Option::clean( $_payload );
 
-        // All calls can request related data to be returned
-        $_related = Option::get( $_payload, 'related' );
-
-        if ( !empty( $_related ) && '*' !== $_related && ( is_string( $_related ) || is_array( $_related ) ) )
-        {
-            $_relations = array();
-
-            if ( !is_array( $_related ) )
-            {
-                $_related = array_map( 'trim', explode( ',', $_related ) );
-            }
-
-            foreach ( $_related as $_relative )
-            {
-                $_extraFields = Option::get( $_payload, $_relative . '_fields', '*' );
-                $_extraOrder = Option::get( $_payload, $_relative . '_order' );
-
-                $_relations[] = array( 'name' => $_relative, 'fields' => $_extraFields, 'order' => $_extraOrder );
-
-                unset( $_relative, $_extraFields, $_extraOrder );
-            }
-
-            $_payload['related'] = $_relations;
-
-            unset( $_relations );
-        }
-
-        return Option::clean( $_payload );
+        return $this;
     }
 
     /**

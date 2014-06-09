@@ -215,6 +215,183 @@ abstract class BasePlatformRestService extends BasePlatformService implements Re
     }
 
     /**
+     * Source of the PRE_PROCESS event
+     *
+     * @return mixed
+     */
+    protected function _preProcess()
+    {
+        if ( $this instanceof BasePlatformRestResource || $this instanceof ServiceOnlyResourceLike )
+        {
+            $this->_triggerActionEvent( $this->_requestData, PlatformServiceEvents::PRE_PROCESS );
+        }
+    }
+
+    /**
+     * Handle any post-request processing
+     * Source of the POST_PROCESS event
+     *
+     * @return mixed
+     */
+    protected function _postProcess()
+    {
+        if ( $this instanceof BasePlatformRestResource || $this instanceof ServiceOnlyResourceLike )
+        {
+            $this->_triggerActionEvent( $this->_response, PlatformServiceEvents::POST_PROCESS );
+        }
+    }
+
+    /**
+     * @param string        $eventName
+     * @param PlatformEvent $event
+     * @param int           $priority
+     *
+     * @return bool|PlatformEvent
+     */
+    public function trigger( $eventName, $event = null, $priority = 0 )
+    {
+        if ( is_array( $event ) )
+        {
+            $event = new PlatformServiceEvent( $this->_apiName, $this->_resource, $event );
+        }
+
+        return Platform::trigger(
+            str_ireplace(
+                array( '{api_name}', '{action}' ),
+                array( $this->_apiName == 'system' ? $this->_resource : $this->_apiName, strtolower( $this->_action ) ),
+                $eventName
+            ),
+            $event ? : new PlatformServiceEvent( $this->_apiName, $this->_resource, $this->_response ),
+            $priority
+        );
+    }
+
+    /**
+     * Triggers the appropriate event for the action /api_name/resource/resourceId.
+     *
+     * The appropriate event is determined by the event mapping maintained in the
+     * resources' Swagger files.
+     *
+     * The event data {@see PlatformEvent::getData()} in the event is the result/response that
+     * the initial REST request is now returning to the client.
+     *
+     * These events will only trigger a single time per request.
+     *
+     * @param mixed                $result    The result of the call
+     * @param string               $eventName The event to trigger. If not supplied, one will looked up based on the context
+     * @param PlatformServiceEvent $event
+     *
+     * @return bool
+     */
+    protected function _triggerActionEvent( &$result, $eventName = null, $event = null )
+    {
+        static $_triggeredEvents = array();
+
+        //  Lookup the appropriate event if not specified.
+        $_eventNames = $eventName ? : SwaggerManager::findEvent( $this, $this->_action );
+        $_eventNames = is_array( $_eventNames ) ? $_eventNames : array( $_eventNames );
+
+        $_inboundData = false;
+        $_result = array();
+        $_pathInfo =
+            trim(
+                str_replace(
+                    '/rest',
+                    null,
+                    Option::server( 'INLINE_REQUEST_URI', Pii::request( false )->getPathInfo() )
+                ),
+                '/'
+            );
+
+        $_values = array(
+            'action'      => strtolower( $this->_action ),
+            'api_name'    => $this->_apiName,
+            'service_id'  => $this->_serviceId,
+            'table_name'  => $this->_resource,
+            'container'   => $this->_resource,
+            'folder_path' => Option::get( $this->_resourceArray, 1 ),
+            'file_path'   => Option::get( $this->_resourceArray, 2 ),
+            'request_uri' => explode( '/', $_pathInfo ),
+        );
+
+        if ( 'rest' !== ( $_part = array_shift( $_values['request_uri'] ) ) )
+        {
+            array_unshift( $_values['request_uri'], $_part );
+        }
+
+        foreach ( $_eventNames as $_eventName )
+        {
+            //  No event or already triggered, bail.
+            if ( empty( $_eventName ) )
+            {
+                continue;
+            }
+
+            //  Construct an event if necessary
+            if ( empty( $result ) )
+            {
+                $_eventData = Option::clean( RestData::getPostedData( true, true ) );
+
+                if ( !empty( $_eventData ) )
+                {
+                    $_inboundData = true;
+                    $result = $_eventData;
+                }
+            }
+
+            $_service = $this->_apiName;
+            $_event = $event ? : new PlatformServiceEvent( $_service, $this->_resource, $result );
+
+            //  Normalize the event name
+            $_eventName = Event::normalizeEventName( $_event, $_eventName, $_values );
+
+            //  Already triggered?
+            if ( isset( $_triggeredEvents[ $_eventName ] ) )
+            {
+                continue;
+            }
+
+            //  Fire it and get the maybe-modified event
+            $_event = $this->trigger( $_eventName, $_event );
+
+            //  Merge back the results
+            if ( $_event instanceOf PlatformEvent )
+            {
+                $_eventData = $_event->getData();
+
+                $result = $_eventData;
+
+                //  Stick it back into the request for processing...
+                if ( $_inboundData )
+                {
+                    $_request = Pii::requestObject();
+
+                    //  Reinitialize with new content...
+                    $_request->initialize(
+                        $_request->query->all(),
+                        $_request->request->all(),
+                        $_request->attributes->all(),
+                        $_request->cookies->all(),
+                        $_request->files->all(),
+                        $_request->server->all(),
+                        is_string( $result ) ? $result : json_encode( $result, JSON_UNESCAPED_SLASHES )
+                    );
+
+                    Pii::app()->setRequestObject( $_request );
+                }
+
+                unset( $_eventData );
+            }
+
+            //  Cache and bail
+            $_triggeredEvents[ $_eventName ] = true;
+            $_result[] = $_event;
+        }
+
+        return 1 == count( $_result ) ? $_result[0] : $_result;
+    }
+
+    /**
      * Allows the resource to respond to special actions. Presentation information for instance.
      */
     protected function _handleExtraActions()
@@ -325,11 +502,14 @@ abstract class BasePlatformRestService extends BasePlatformService implements Re
      * Apply the commonly used REST path members to the class
      *
      * @param string $resourcePath
+     * @param bool   $wrapped If true, payload is wrapped in "record" array
      *
      * @return $this
      */
-    protected function _detectResourceMembers( $resourcePath = null )
+    protected function _detectResourceMembers( $resourcePath = null, $wrapped = true )
     {
+        parent::_detectResourceMembers( $wrapped );
+
         $this->_resourcePath = $resourcePath;
         $this->_resourceArray = ( !empty( $this->_resourcePath ) ) ? explode( '/', $this->_resourcePath ) : array();
 
@@ -342,33 +522,6 @@ abstract class BasePlatformRestService extends BasePlatformService implements Re
         }
 
         return $this;
-    }
-
-    /**
-     * Source of the PRE_PROCESS event
-     *
-     * @return mixed
-     */
-    protected function _preProcess()
-    {
-        if ( $this instanceof BasePlatformRestResource || $this instanceof ServiceOnlyResourceLike )
-        {
-            $this->_triggerActionEvent( $this->_requestData, PlatformServiceEvents::PRE_PROCESS );
-        }
-    }
-
-    /**
-     * Handle any post-request processing
-     * Source of the POST_PROCESS event
-     *
-     * @return mixed
-     */
-    protected function _postProcess()
-    {
-        if ( $this instanceof BasePlatformRestResource || $this instanceof ServiceOnlyResourceLike )
-        {
-            $this->_triggerActionEvent( $this->_response, PlatformServiceEvents::POST_PROCESS );
-        }
     }
 
     /**
@@ -540,156 +693,6 @@ abstract class BasePlatformRestService extends BasePlatformService implements Re
     public function getPermissions( $resource = null )
     {
         return ResourceStore::getPermissions( $this->_apiName, $resource );
-    }
-
-    /**
-     * @param string        $eventName
-     * @param PlatformEvent $event
-     * @param int           $priority
-     *
-     * @return bool|PlatformEvent
-     */
-    public function trigger( $eventName, $event = null, $priority = 0 )
-    {
-        if ( is_array( $event ) )
-        {
-            $event = new PlatformServiceEvent( $this->_apiName, $this->_resource, $event );
-        }
-
-        return Platform::trigger(
-            str_ireplace(
-                array( '{api_name}', '{action}' ),
-                array( $this->_apiName == 'system' ? $this->_resource : $this->_apiName, strtolower( $this->_action ) ),
-                $eventName
-            ),
-            $event ? : new PlatformServiceEvent( $this->_apiName, $this->_resource, $this->_response ),
-            $priority
-        );
-    }
-
-    /**
-     * Triggers the appropriate event for the action /api_name/resource/resourceId.
-     *
-     * The appropriate event is determined by the event mapping maintained in the
-     * resources' Swagger files.
-     *
-     * The event data {@see PlatformEvent::getData()} in the event is the result/response that
-     * the initial REST request is now returning to the client.
-     *
-     * These events will only trigger a single time per request.
-     *
-     * @param mixed                $result    The result of the call
-     * @param string               $eventName The event to trigger. If not supplied, one will looked up based on the context
-     * @param PlatformServiceEvent $event
-     *
-     * @return bool
-     */
-    protected function _triggerActionEvent( &$result, $eventName = null, $event = null )
-    {
-        static $_triggeredEvents = array();
-
-        //  Lookup the appropriate event if not specified.
-        $_eventNames = $eventName ? : SwaggerManager::findEvent( $this, $this->_action );
-        $_eventNames = is_array( $_eventNames ) ? $_eventNames : array( $_eventNames );
-
-        $_inboundData = false;
-        $_result = array();
-        $_pathInfo =
-            trim(
-                str_replace(
-                    '/rest',
-                    null,
-                    Option::server( 'INLINE_REQUEST_URI', Pii::request( false )->getPathInfo() )
-                ),
-                '/'
-            );
-
-        $_values = array(
-            'action'      => strtolower( $this->_action ),
-            'api_name'    => $this->_apiName,
-            'service_id'  => $this->_serviceId,
-            'table_name'  => $this->_resource,
-            'container'   => $this->_resource,
-            'folder_path' => Option::get( $this->_resourceArray, 1 ),
-            'file_path'   => Option::get( $this->_resourceArray, 2 ),
-            'request_uri' => explode( '/', $_pathInfo ),
-        );
-
-        if ( 'rest' !== ( $_part = array_shift( $_values['request_uri'] ) ) )
-        {
-            array_unshift( $_values['request_uri'], $_part );
-        }
-
-        foreach ( $_eventNames as $_eventName )
-        {
-            //  No event or already triggered, bail.
-            if ( empty( $_eventName ) )
-            {
-                continue;
-            }
-
-            //  Construct an event if necessary
-            if ( empty( $result ) )
-            {
-                $_eventData = Option::clean( RestData::getPostedData( true, true ) );
-
-                if ( !empty( $_eventData ) )
-                {
-                    $_inboundData = true;
-                    $result = $_eventData;
-                }
-            }
-
-            $_service = $this->_apiName;
-            $_event = $event ? : new PlatformServiceEvent( $_service, $this->_resource, $result );
-
-            //  Normalize the event name
-            $_eventName = Event::normalizeEventName( $_event, $_eventName, $_values );
-
-            //  Already triggered?
-            if ( isset( $_triggeredEvents[ $_eventName ] ) )
-            {
-                continue;
-            }
-
-            //  Fire it and get the maybe-modified event
-            $_event = $this->trigger( $_eventName, $_event );
-
-            //  Merge back the results
-            if ( $_event instanceOf PlatformEvent )
-            {
-                $_eventData = $_event->getData();
-
-                $result = $_eventData;
-
-                //  Stick it back into the request for processing...
-                if ( $_inboundData )
-                {
-                    $_request = Pii::requestObject();
-
-                    //  Reinitialize with new content...
-                    $_request->initialize(
-                        $_request->query->all(),
-                        $_request->request->all(),
-                        $_request->attributes->all(),
-                        $_request->cookies->all(),
-                        $_request->files->all(),
-                        $_request->server->all(),
-                        is_string( $result ) ? $result : json_encode( $result, JSON_UNESCAPED_SLASHES )
-                    );
-
-                    Pii::app()->setRequestObject( $_request );
-                }
-
-                unset( $_eventData );
-            }
-
-            //  Cache and bail
-            $_triggeredEvents[ $_eventName ] = true;
-            $_result[] = $_event;
-        }
-
-        return 1 == count( $_result ) ? $_result[0] : $_result;
     }
 
     /**
